@@ -12,7 +12,9 @@ import (
 	"github.com/filecoin-project/go-legs"
 	"github.com/filecoin-project/go-legs/dtsync"
 	"github.com/filecoin-project/go-legs/httpsync"
-	"github.com/filecoin-project/storetheindex/api/v0/finder/model"
+	"github.com/filecoin-project/index-provider/engine"
+	finder_model "github.com/filecoin-project/storetheindex/api/v0/finder/model"
+	finder_schema "github.com/filecoin-project/storetheindex/api/v0/ingest/schema"
 	"github.com/ipfs/go-cid"
 	logging "github.com/ipfs/go-log"
 	"github.com/ipld/go-ipld-prime"
@@ -24,13 +26,30 @@ import (
 	"github.com/libp2p/go-libp2p"
 	peer "github.com/libp2p/go-libp2p-core/peer"
 	"github.com/multiformats/go-multiaddr"
-	"github.com/multiformats/go-multicodec"
-	"github.com/multiformats/go-multihash"
 	"github.com/willscott/index-observer/safemapds"
 	"golang.org/x/time/rate"
 )
 
 var log = logging.Logger("test")
+
+type Scraper struct {
+	engine *engine.Engine
+}
+
+func NewScraper() (*Scraper, error) {
+	engine, err := engine.New()
+	if err != nil {
+		return nil, fmt.Errorf("could not create engine: %w", err)
+	}
+
+	return &Scraper{
+		engine: engine,
+	}, nil
+}
+
+func (scraper *Scraper) Run(ctx context.Context) {
+
+}
 
 func main() {
 	logging.SetLogLevel("test", "debug")
@@ -47,12 +66,14 @@ func test() error {
 
 	log.Infof("Testing index provider")
 
-	providersRes, err := http.DefaultClient.Get("http://localhost:3000/providers")
+	// endpoint := "http://localhost:3000/providers"
+	endpoint := "https://cid.contact/providers"
+	providersRes, err := http.DefaultClient.Get(endpoint)
 	if err != nil {
 		return err
 	}
 	defer providersRes.Body.Close()
-	var providers []model.ProviderInfo
+	var providers []finder_model.ProviderInfo
 	if err := json.NewDecoder(providersRes.Body).Decode(&providers); err != nil {
 		return err
 	}
@@ -61,7 +82,7 @@ func test() error {
 	var wg sync.WaitGroup
 	for _, provider := range providers {
 		wg.Add(1)
-		go func(provider model.ProviderInfo) {
+		go func(provider finder_model.ProviderInfo) {
 			log.Infof("--- GETTING ADVERTISEMENTS FOR %s", provider.AddrInfo.ID)
 
 			if err := getProviderAdvertisements(ctx, provider); err != nil {
@@ -77,9 +98,9 @@ func test() error {
 	return nil
 }
 
-func getProviderAdvertisements(ctx context.Context, provider model.ProviderInfo) error {
+func getProviderAdvertisements(ctx context.Context, provider finder_model.ProviderInfo) error {
 	lsys := cidlink.DefaultLinkSystem()
-	store := memstore.Store{Bag: map[string][]byte{}}
+	store := memstore.Store{}
 	lsys.SetReadStorage(&store)
 	lsys.SetWriteStorage(&store)
 	lsys.TrustedStorage = true
@@ -93,7 +114,7 @@ func getProviderAdvertisements(ctx context.Context, provider model.ProviderInfo)
 		defer sync.Close()
 		_syncer, err := sync.NewSyncer(provider.AddrInfo.ID, provider.AddrInfo.Addrs[0], rl)
 		if err != nil {
-			return err
+			return fmt.Errorf("could not create http syncer: %w", err)
 		}
 		syncer = _syncer
 	} else {
@@ -101,22 +122,22 @@ func getProviderAdvertisements(ctx context.Context, provider model.ProviderInfo)
 
 		host, err := libp2p.New()
 		if err != nil {
-			return err
+			return fmt.Errorf("could not create p2p host: %w", err)
 		}
 		defer host.Close()
 		host.Peerstore().AddAddrs(provider.AddrInfo.ID, provider.AddrInfo.Addrs, time.Hour*24*7)
 		ds := safemapds.NewMapDatastore()
 		sync, err := dtsync.NewSync(host, ds, lsys, func(i peer.ID, c cid.Cid) {})
 		if err != nil {
-			return err
+			return fmt.Errorf("could not create datastore: %w", err)
 		}
 		defer sync.Close()
 		if err := host.Connect(ctx, provider.AddrInfo); err != nil {
-			return err
+			return fmt.Errorf("failed to connect to host: %w", err)
 		}
 		protos, err := host.Peerstore().GetProtocols(provider.AddrInfo.ID)
 		if err != nil {
-			return err
+			return fmt.Errorf("could not get protocols: %w", err)
 		}
 		topic := topicFromSupportedProtocols(protos)
 		syncer = sync.NewSyncer(provider.AddrInfo.ID, topic, rl)
@@ -124,52 +145,67 @@ func getProviderAdvertisements(ctx context.Context, provider model.ProviderInfo)
 
 	headCid, err := syncer.GetHead(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("syncer could not get head: %w", err)
 	}
 
 	ssb := builder.NewSelectorSpecBuilder(basicnode.Prototype.Any)
-	adSelector := ssb.ExploreFields(func(efsb builder.ExploreFieldsSpecBuilder) {
-		efsb.Insert("PreviousID", ssb.ExploreRecursiveEdge())
-	})
-
-	identityMH, err := multihash.Encode(nil, multihash.IDENTITY)
-	if err != nil {
-		return err
-	}
+	adSelector := ssb.ExploreRecursive(
+		selector.RecursionLimitNone(),
+		ssb.ExploreFields(func(efsb builder.ExploreFieldsSpecBuilder) {
+			efsb.Insert("PreviousID", ssb.ExploreRecursiveEdge())
+		}),
+	).Node()
 
 	queuedCid := headCid
 
 	for queuedCid != cid.Undef {
-		// selector := legs.ExploreRecursiveWithStop(selector.RecursionLimitDepth(5000), adSelector, cidlink.Link{Cid: provider.LastAdvertisement})
-		selector := legs.ExploreRecursiveWithStop(selector.RecursionLimitDepth(500), adSelector, cidlink.Link{Cid: cid.NewCidV1(uint64(multicodec.Raw), identityMH)})
-		if err := syncer.Sync(ctx, queuedCid, selector); err != nil {
+		if err := syncer.Sync(ctx, queuedCid, adSelector); err != nil {
 			return fmt.Errorf("failed to sync: %w", err)
 		}
 
-		ad, err := lsys.Load(ipld.LinkContext{}, cidlink.Link{Cid: queuedCid}, basicnode.Prototype.Any)
+		adNode, err := lsys.Load(ipld.LinkContext{}, cidlink.Link{Cid: queuedCid}, basicnode.Prototype.Any)
 		if err != nil {
-			return fmt.Errorf("failed to load: %w", err)
+			return fmt.Errorf("failed to load advertisement: %w", err)
 		}
 
-		previousID, err := ad.LookupByString("PreviousID")
+		ad, err := finder_schema.UnwrapAdvertisement(adNode)
 		if err != nil {
-			log.Infof("===> DONE WITH %s!", provider.AddrInfo.ID)
+			return fmt.Errorf("failed to unwrap advertisement: %w", err)
+		}
+
+		entriesSelector := ssb.ExploreRecursive(
+			selector.RecursionLimitNone(),
+			ssb.ExploreFields(func(efsb builder.ExploreFieldsSpecBuilder) {
+				efsb.Insert("Entries", ssb.ExploreRecursiveEdge())
+			}),
+		)
+		syncer.Sync(ctx, ad.Entries.(cidlink.Link).Cid, entriesSelector.Node())
+
+		entriesNode, err := lsys.Load(ipld.LinkContext{}, ad.Entries, basicnode.Prototype.Any)
+		if err != nil {
+			return fmt.Errorf("failed to load entries node: %w", err)
+		}
+
+		entries, err := finder_schema.UnwrapEntryChunk(entriesNode)
+		if err != nil {
+			return fmt.Errorf("failed to unwrap entry chunk: %w", err)
+		}
+
+		log.Infof("===> GOT %s from %s (first entry chunk length %d)", queuedCid, provider.AddrInfo.ID, len(entries.Entries))
+
+		if ad.PreviousID == nil {
 			break
 		}
 
-		previousIDLink, err := previousID.AsLink()
-		if err != nil {
-			return err
-		}
-
+		previousIDLink := *ad.PreviousID
 		if previousIDCidLink, ok := previousIDLink.(cidlink.Link); ok {
-			log.Infof("===> GOT %s from %s", queuedCid, provider.AddrInfo.ID)
-
 			queuedCid = previousIDCidLink.Cid
 		} else {
-			return fmt.Errorf("previous ID wasn't a CID")
+			return fmt.Errorf("previous ID wasn't a CID link")
 		}
 	}
+
+	log.Infof("===> DONE WITH %s", provider.AddrInfo.ID)
 
 	return nil
 }
