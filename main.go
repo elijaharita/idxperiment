@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"path"
 	"regexp"
+	"sync"
 	"time"
 
 	"github.com/filecoin-project/go-legs"
@@ -66,48 +67,56 @@ func (scraper *Scraper) Run(ctx context.Context) error {
 		return err
 	}
 
+	var wg sync.WaitGroup
 	for _, provider := range providers {
-		log.Infof("Getting advertisements for provider %s", provider.AddrInfo.ID)
+		wg.Add(1)
 
-		syncer, lsys, closer, err := scraper.GetSyncer(ctx, provider.AddrInfo)
-		if err != nil {
-			log.Errorf("Could not get syncer for provider %s: %v", provider.AddrInfo.ID, err)
-			continue
-		}
-		defer closer()
+		func(provider finder_model.ProviderInfo) {
+			defer wg.Done()
 
-		ads, err := scraper.GetAdvertisements(ctx, syncer, lsys, provider)
-		if err != nil {
-			log.Errorf("Could not get advertisements for provider %s: %v", provider.AddrInfo.ID, err)
-			continue
-		}
+			log.Infof("Getting advertisements for provider %s", provider.AddrInfo.ID)
 
-		for ad := range ads {
-			log.Infof("Getting entries for advertisement %s", ad.AdvertisementCid)
-
-			if err := ad.Err; err != nil {
-				log.Errorf("Failed to get ad: %v", err)
-				continue
-			}
-
-			entries, err := scraper.GetEntries(ctx, syncer, lsys, ad.Advertisement)
+			syncer, lsys, closer, err := scraper.GetSyncer(ctx, provider.AddrInfo)
 			if err != nil {
-				log.Errorf("Failed to get entries for ad %s: %v", ad.AdvertisementCid, err)
-				continue
+				log.Errorf("Could not get syncer for provider %s: %v", provider.AddrInfo.ID, err)
+				return
+			}
+			defer closer()
+
+			ads, err := scraper.GetAdvertisements(ctx, syncer, lsys, provider)
+			if err != nil {
+				log.Errorf("Could not get advertisements for provider %s: %v", provider.AddrInfo.ID, err)
+				return
 			}
 
-			entryCount := 0
-			for entry := range entries {
-				if err := entry.Err; err != nil {
-					log.Errorf("Failed to get entry for ad: %v", err)
+			for ad := range ads {
+				log.Infof("Getting entries for advertisement %s", ad.AdvertisementCid)
+
+				if err := ad.Err; err != nil {
+					log.Errorf("Failed to get ad: %v", err)
 					continue
 				}
-				entryCount++
-			}
 
-			log.Infof("Got %d entries for advertisement %s", entryCount, ad.AdvertisementCid)
-		}
+				entries, err := scraper.GetEntries(ctx, syncer, lsys, ad.Advertisement)
+				if err != nil {
+					log.Errorf("Failed to get entries for ad %s: %v", ad.AdvertisementCid, err)
+					continue
+				}
+
+				entryCount := 0
+				for entry := range entries {
+					if err := entry.Err; err != nil {
+						log.Errorf("Failed to get entry for ad: %v", err)
+						continue
+					}
+					entryCount++
+				}
+
+				log.Infof("Got %d entries for advertisement %s", entryCount, ad.AdvertisementCid)
+			}
+		}(provider)
 	}
+	wg.Wait()
 
 	return nil
 }
@@ -159,15 +168,27 @@ func (scraper *Scraper) GetAdvertisements(
 		return fail(fmt.Errorf("syncer could not get head: %w", err))
 	}
 
+	// emptyMH, err := multihash.Encode([]byte{}, multihash.IDENTITY)
+	// if err != nil {
+	// 	return fail(err)
+	// }
+	// emptyNode := cidlink.Link{Cid: cid.NewCidV1(uint64(cid.Raw), emptyMH)}
 	ssb := builder.NewSelectorSpecBuilder(basicnode.Prototype.Any)
-	adSelector := ssb.ExploreRecursive(
+	adSelector := legs.ExploreRecursiveWithStop(
 		selector.RecursionLimitNone(),
 		ssb.ExploreFields(func(efsb builder.ExploreFieldsSpecBuilder) {
 			efsb.Insert("PreviousID", ssb.ExploreRecursiveEdge())
 		}),
-	).Node()
+		nil,
+	)
 
-	queuedCid := headCid
+	queuedAdvertisement := cidlink.Link{Cid: headCid}
+
+	log.Infof("Syncing...")
+	if err := syncer.Sync(ctx, queuedAdvertisement.Cid, adSelector); err != nil {
+		return fail(fmt.Errorf("failed to sync: %w", err))
+	}
+	log.Infof("Done syncing")
 
 	// Advertisements stored from most recent (reverse of required order)
 	var adsReverse []GetAdvertisementsResult
@@ -183,21 +204,16 @@ func (scraper *Scraper) GetAdvertisements(
 			}
 		}
 
-		for queuedCid != cid.Undef {
+		for queuedAdvertisement.Cid != cid.Undef {
 
-			log.Debugf("Reading advertisement: %s", queuedCid)
+			log.Debugf("Reading advertisement %s from %s", queuedAdvertisement, provider.AddrInfo.ID)
 
 			if err := ctx.Err(); err != nil {
 				sendFail(err)
 				break
 			}
 
-			if err := syncer.Sync(ctx, queuedCid, adSelector); err != nil {
-				sendFail(fmt.Errorf("failed to sync: %w", err))
-				break
-			}
-
-			adNode, err := lsys.Load(ipld.LinkContext{}, cidlink.Link{Cid: queuedCid}, basicnode.Prototype.Any)
+			adNode, err := lsys.Load(ipld.LinkContext{}, queuedAdvertisement, basicnode.Prototype.Any)
 			if err != nil {
 				sendFail(fmt.Errorf("failed to load advertisement: %w", err))
 				break
@@ -209,18 +225,25 @@ func (scraper *Scraper) GetAdvertisements(
 				break
 			}
 
+			log.Infof("Adding ad CID: %s", queuedAdvertisement.Cid)
 			adsReverse = append(adsReverse, GetAdvertisementsResult{
 				Advertisement:    *ad,
-				AdvertisementCid: queuedCid,
+				AdvertisementCid: queuedAdvertisement.Cid,
 			})
 
 			if ad.PreviousID == nil {
+				log.Debugf("Got to genesis advertisement for provider: %s", provider.AddrInfo.ID)
 				break
 			}
 
 			previousIDLink := *ad.PreviousID
 			if previousIDCidLink, ok := previousIDLink.(cidlink.Link); ok {
-				queuedCid = previousIDCidLink.Cid
+				// oldQueuedAdvertisement = queuedAdvertisement
+				queuedAdvertisement = previousIDCidLink
+
+				if queuedAdvertisement.Cid == cid.Undef {
+					break
+				}
 			} else {
 				sendFail(fmt.Errorf("previous ID wasn't a CID link"))
 				break
@@ -250,20 +273,24 @@ func (scraper *Scraper) GetEntries(
 	ad finder_schema.Advertisement,
 ) (<-chan GetEntriesResult, error) {
 	// Error shorthand
-	// fail := func(err error) (<-chan GetEntriesResult, error) {
-	// 	return nil, err
-	// }
+	fail := func(err error) (<-chan GetEntriesResult, error) {
+		return nil, err
+	}
 
 	ssb := builder.NewSelectorSpecBuilder(basicnode.Prototype.Any)
-
 	entriesSelector := ssb.ExploreRecursive(
 		selector.RecursionLimitNone(),
 		ssb.ExploreFields(func(efsb builder.ExploreFieldsSpecBuilder) {
-			efsb.Insert("Entries", ssb.ExploreRecursiveEdge())
+			efsb.Insert("Entries", ssb.ExploreAll(ssb.Matcher()))
+			efsb.Insert("Next", ssb.ExploreRecursiveEdge())
 		}),
 	)
 
 	queuedEntry := ad.Entries
+
+	if err := syncer.Sync(ctx, queuedEntry.(cidlink.Link).Cid, entriesSelector.Node()); err != nil {
+		return fail(err)
+	}
 
 	entriesChan := make(chan GetEntriesResult, 10)
 	go func() {
@@ -279,15 +306,9 @@ func (scraper *Scraper) GetEntries(
 		i := 0
 
 		for queuedEntry != nil {
-
-			if err := syncer.Sync(ctx, queuedEntry.(cidlink.Link).Cid, entriesSelector.Node()); err != nil {
-				sendFail(err)
-				break
-			}
-
 			entriesNode, err := lsys.Load(ipld.LinkContext{}, queuedEntry, basicnode.Prototype.Any)
 			if err != nil {
-				sendFail(fmt.Errorf("failed to load entries node: %w", err))
+				sendFail(fmt.Errorf("failed to load entries node %v: %w", queuedEntry, err))
 				break
 			}
 
@@ -363,16 +384,18 @@ func (scraper *Scraper) GetSyncer(
 
 		ds := safemapds.NewMapDatastore()
 
+		if err := scraper.Host.Connect(ctx, addrInfo); err != nil {
+			return fail(fmt.Errorf("failed to connect to host: %w", err))
+		}
+		scraper.Host.ConnManager().Protect(addrInfo.ID, "scraper")
+
 		sync, err := dtsync.NewSync(scraper.Host, ds, lsys, func(i peer.ID, c cid.Cid) {})
 		if err != nil {
 			return fail(fmt.Errorf("could not create datastore: %w", err))
 		}
 		closer = func() {
 			sync.Close()
-		}
-
-		if err := scraper.Host.Connect(ctx, addrInfo); err != nil {
-			return fail(fmt.Errorf("failed to connect to host: %w", err))
+			scraper.Host.ConnManager().Unprotect(addrInfo.ID, "scraper")
 		}
 
 		protos, err := scraper.Host.Peerstore().GetProtocols(addrInfo.ID)
@@ -393,7 +416,7 @@ func main() {
 
 	datastore := safemapds.NewMapDatastore()
 
-	host, err := libp2p.New()
+	host, err := libp2p.New(libp2p.DisableRelay())
 	if err != nil {
 		log.Fatal(err)
 	}
