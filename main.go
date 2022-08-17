@@ -34,7 +34,7 @@ import (
 	"golang.org/x/time/rate"
 )
 
-var log = logging.Logger("test")
+var log = logging.Logger("idxperiment")
 
 type AdvertisementResult struct {
 	Cid           cid.Cid
@@ -43,8 +43,6 @@ type AdvertisementResult struct {
 
 // Scraper connects to providers listed by the indexer and queries their
 // advertisements
-//
-// See MarkProcessed()
 type Scraper struct {
 	IndexerURL     string
 	Datastore      datastore.Datastore
@@ -85,6 +83,8 @@ func (scraper *Scraper) Run(ctx context.Context) error {
 		}
 
 		for ad := range ads {
+			log.Infof("Getting entries for advertisement %s", ad.AdvertisementCid)
+
 			if err := ad.Err; err != nil {
 				log.Errorf("Failed to get ad: %v", err)
 				continue
@@ -96,14 +96,16 @@ func (scraper *Scraper) Run(ctx context.Context) error {
 				continue
 			}
 
+			entryCount := 0
 			for entry := range entries {
 				if err := entry.Err; err != nil {
 					log.Errorf("Failed to get entry for ad: %v", err)
 					continue
 				}
-
-				log.Debugf("Got entry %s for ad %s (rm: %v)", entry.Entry, ad.AdvertisementCid, entry.IsRm)
+				entryCount++
 			}
+
+			log.Infof("Got %d entries for advertisement %s", entryCount, ad.AdvertisementCid)
 		}
 	}
 
@@ -168,7 +170,7 @@ func (scraper *Scraper) GetAdvertisements(
 	queuedCid := headCid
 
 	// Advertisements stored from most recent (reverse of required order)
-	var adsReverse []finder_schema.Advertisement
+	var adsReverse []GetAdvertisementsResult
 
 	adsChan := make(chan GetAdvertisementsResult, 10)
 	go func() {
@@ -207,7 +209,10 @@ func (scraper *Scraper) GetAdvertisements(
 				break
 			}
 
-			adsReverse = append(adsReverse, *ad)
+			adsReverse = append(adsReverse, GetAdvertisementsResult{
+				Advertisement:    *ad,
+				AdvertisementCid: queuedCid,
+			})
 
 			if ad.PreviousID == nil {
 				break
@@ -224,19 +229,15 @@ func (scraper *Scraper) GetAdvertisements(
 
 		// Send ads from end to beginning
 		for i := len(adsReverse) - 1; i >= 0; i-- {
-			adsChan <- GetAdvertisementsResult{
-				Advertisement:    adsReverse[i],
-				AdvertisementCid: queuedCid,
-			}
+			adsChan <- adsReverse[i]
 		}
 	}()
 
 	return adsChan, nil
 }
 
-type EntriesResult struct {
+type GetEntriesResult struct {
 	Entry multihash.Multihash
-	IsRm  bool
 
 	// If non-nil, other values are invalid
 	Err error
@@ -247,11 +248,11 @@ func (scraper *Scraper) GetEntries(
 	syncer legs.Syncer,
 	lsys ipld.LinkSystem,
 	ad finder_schema.Advertisement,
-) (<-chan EntriesResult, error) {
+) (<-chan GetEntriesResult, error) {
 	// Error shorthand
-	fail := func(err error) (<-chan EntriesResult, error) {
-		return nil, err
-	}
+	// fail := func(err error) (<-chan GetEntriesResult, error) {
+	// 	return nil, err
+	// }
 
 	ssb := builder.NewSelectorSpecBuilder(basicnode.Prototype.Any)
 
@@ -261,30 +262,57 @@ func (scraper *Scraper) GetEntries(
 			efsb.Insert("Entries", ssb.ExploreRecursiveEdge())
 		}),
 	)
-	syncer.Sync(ctx, ad.Entries.(cidlink.Link).Cid, entriesSelector.Node())
 
-	entriesNode, err := lsys.Load(ipld.LinkContext{}, ad.Entries, basicnode.Prototype.Any)
-	if err != nil {
-		return fail(fmt.Errorf("failed to load entries node: %w", err))
-	}
+	queuedEntry := ad.Entries
 
-	entryChunk, err := finder_schema.UnwrapEntryChunk(entriesNode)
-	if err != nil {
-		return fail(fmt.Errorf("failed to unwrap entry chunk: %w", err))
-	}
-
-	entriesChan := make(chan EntriesResult, 10)
+	entriesChan := make(chan GetEntriesResult, 10)
 	go func() {
 		defer close(entriesChan)
 
-		for _, entry := range entryChunk.Entries {
-			entriesChan <- EntriesResult{
-				Entry: entry,
-				IsRm:  ad.IsRm,
+		// Goroutine error shorthand
+		sendFail := func(err error) {
+			entriesChan <- GetEntriesResult{
+				Err: err,
 			}
 		}
 
-		log.Warnf("TODO: read all entry chunks instead of just first")
+		i := 0
+
+		for queuedEntry != nil {
+
+			if err := syncer.Sync(ctx, queuedEntry.(cidlink.Link).Cid, entriesSelector.Node()); err != nil {
+				sendFail(err)
+				break
+			}
+
+			entriesNode, err := lsys.Load(ipld.LinkContext{}, queuedEntry, basicnode.Prototype.Any)
+			if err != nil {
+				sendFail(fmt.Errorf("failed to load entries node: %w", err))
+				break
+			}
+
+			entryChunk, err := finder_schema.UnwrapEntryChunk(entriesNode)
+			if err != nil {
+				sendFail(fmt.Errorf("failed to unwrap entry chunk: %w", err))
+				break
+			}
+
+			for _, entry := range entryChunk.Entries {
+				entriesChan <- GetEntriesResult{
+					Entry: entry,
+				}
+			}
+
+			log.Debugf("Processing entry index %d (len %d)", i, len(entryChunk.Entries))
+
+			i++
+
+			if entryChunk.Next == nil {
+				break
+			}
+
+			queuedEntry = *entryChunk.Next
+		}
 	}()
 
 	return entriesChan, nil
@@ -361,7 +389,7 @@ func (scraper *Scraper) GetSyncer(
 }
 
 func main() {
-	logging.SetLogLevel("test", "debug")
+	logging.SetLogLevel("idxperiment", "debug")
 
 	datastore := safemapds.NewMapDatastore()
 
