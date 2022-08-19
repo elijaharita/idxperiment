@@ -108,6 +108,9 @@ func (scraper *Scraper) Run(ctx context.Context) error {
 				go func() {
 					defer wg.Done()
 					for {
+						if threadsCtx.Err() != nil {
+							break
+						}
 
 						adIndexLk.Lock()
 						adIndex := nextAdIndex
