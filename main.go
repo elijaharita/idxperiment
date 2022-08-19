@@ -100,16 +100,23 @@ func (scraper *Scraper) Run(ctx context.Context) error {
 
 			var adIndexLk sync.Mutex
 			nextAdIndex := 0
+			threadsCtx, threadsCancel := context.WithCancel(ctx)
+			defer threadsCancel()
 			for threadIndex := 0; threadIndex < 4; threadIndex++ {
 				wg.Add(1)
 
 				go func() {
 					defer wg.Done()
 					for {
+
 						adIndexLk.Lock()
 						adIndex := nextAdIndex
 						nextAdIndex++
 						adIndexLk.Unlock()
+
+						if adIndex >= len(ads) {
+							break
+						}
 
 						ad := ads[adIndex]
 
@@ -131,10 +138,11 @@ func (scraper *Scraper) Run(ctx context.Context) error {
 						maxAttempts := 5
 						for i := 1; i <= maxAttempts; i++ {
 							log.Infof("Getting entries for advertisement %s (attempt %d/%d)", adCid, i, maxAttempts)
-							_entries, err := scraper.GetEntries(ctx, syncer, lsys, ad)
+							_entries, err := scraper.GetEntries(threadsCtx, syncer, lsys, ad)
 							if err != nil {
 								log.Errorf("Failed to get entries for ad %s: %v", adCid, err)
 								if i == maxAttempts {
+									threadsCancel()
 									return
 								}
 								time.Sleep(time.Second)
