@@ -86,29 +86,34 @@ func (scraper *Scraper) Run(ctx context.Context) error {
 			}
 			defer closer()
 
+			// SAFETY: ads is read-only after this point and needs no lock - do
+			// not write to it
 			ads, err := scraper.GetAdvertisements(ctx, syncer, lsys, provider)
 			if err != nil {
 				log.Errorf("Could not get advertisements for provider %s: %v", provider.AddrInfo.ID, err)
 				return
 			}
 
-			type queuedAd struct {
-				i  int
-				ad finder_schema.Advertisement
-			}
-			adChan := make(chan queuedAd)
-
 			// SAFETY: no lock because each goroutine touches only its own index
 			entriesNested := make([][]multihash.Multihash, len(ads))
 			var wg sync.WaitGroup
-			for i := 0; i < 16; i++ {
+
+			var adIndexLk sync.Mutex
+			nextAdIndex := 0
+			for threadIndex := 0; threadIndex < 4; threadIndex++ {
 				wg.Add(1)
 
 				go func() {
 					defer wg.Done()
-					for ad := range adChan {
+					for {
+						adIndexLk.Lock()
+						adIndex := nextAdIndex
+						nextAdIndex++
+						adIndexLk.Unlock()
 
-						adNode, err := ad.ad.ToNode()
+						ad := ads[adIndex]
+
+						adNode, err := ad.ToNode()
 						if err != nil {
 							log.Errorf("Failed to get ad node: %v", err)
 							return
@@ -122,12 +127,21 @@ func (scraper *Scraper) Run(ctx context.Context) error {
 						adMH, _ := multihash.Encode(adHash[:16], multihash.SHA2_256)
 						adCid := cid.NewCidV1(cid.DagJSON, adMH)
 
-						log.Infof("Getting entries for advertisement %s", adCid)
-
-						entries, err := scraper.GetEntries(ctx, syncer, lsys, ad.ad)
-						if err != nil {
-							log.Errorf("Failed to get entries for ad %s: %v", adCid, err)
-							return
+						var entries <-chan GetEntriesResult
+						maxAttempts := 5
+						for i := 1; i <= maxAttempts; i++ {
+							log.Infof("Getting entries for advertisement %s (attempt %d/%d)", adCid, i, maxAttempts)
+							_entries, err := scraper.GetEntries(ctx, syncer, lsys, ad)
+							if err != nil {
+								log.Errorf("Failed to get entries for ad %s: %v", adCid, err)
+								if i == maxAttempts {
+									return
+								}
+								time.Sleep(time.Second)
+								continue
+							}
+							entries = _entries
+							break
 						}
 
 						entryCount := 0
@@ -137,23 +151,15 @@ func (scraper *Scraper) Run(ctx context.Context) error {
 								continue
 							}
 
-							entriesNested[ad.i] = append(entriesNested[ad.i], entry.Entry)
+							entriesNested[adIndex] = append(entriesNested[adIndex], entry.Entry)
 
 							entryCount++
 						}
 
-						log.Infof("Got %d entries for for advertisement %s (%d/%d)", entryCount, adCid, ad.i, len(ads))
+						log.Infof("Got %d entries for for advertisement %s (%d/%d)", entryCount, adCid, adIndex, len(ads))
 					}
 				}()
 			}
-
-			for i, ad := range ads {
-				adChan <- queuedAd{
-					i:  i,
-					ad: ad,
-				}
-			}
-			close(adChan)
 
 			wg.Wait()
 		}(provider)
@@ -285,9 +291,12 @@ func (scraper *Scraper) GetEntries(
 	lsys ipld.LinkSystem,
 	ad finder_schema.Advertisement,
 ) (<-chan GetEntriesResult, error) {
+	entriesChan := make(chan GetEntriesResult, 10)
+
 	// Error shorthand
 	fail := func(err error) (<-chan GetEntriesResult, error) {
-		return nil, err
+		close(entriesChan)
+		return entriesChan, err
 	}
 
 	ssb := builder.NewSelectorSpecBuilder(basicnode.Prototype.Any)
@@ -304,8 +313,6 @@ func (scraper *Scraper) GetEntries(
 	if err := syncer.Sync(ctx, queuedEntry.(cidlink.Link).Cid, entriesSelector.Node()); err != nil {
 		return fail(err)
 	}
-
-	entriesChan := make(chan GetEntriesResult, 10)
 	go func() {
 		defer close(entriesChan)
 
