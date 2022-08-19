@@ -63,16 +63,23 @@ func (scraper *Scraper) Run(ctx context.Context) error {
 		return err
 	}
 
+	// Set up link system
+	lsys := cidlink.DefaultLinkSystem()
+	store := memstore.Store{}
+	lsys.SetReadStorage(&store)
+	lsys.SetWriteStorage(&store)
+	lsys.TrustedStorage = true
+
 	var wg sync.WaitGroup
 	for _, provider := range providers {
 		wg.Add(1)
 
-		go func(provider finder_model.ProviderInfo) {
+		func(provider finder_model.ProviderInfo) {
 			defer wg.Done()
 
 			log.Infof("Getting advertisements for provider %s", provider.AddrInfo.ID)
 
-			syncer, lsys, closer, err := scraper.GetSyncer(ctx, provider.AddrInfo)
+			syncer, closer, err := scraper.GetSyncer(ctx, provider.AddrInfo, lsys)
 			if err != nil {
 				log.Errorf("Could not get syncer for provider %s: %v", provider.AddrInfo.ID, err)
 				return
@@ -85,51 +92,69 @@ func (scraper *Scraper) Run(ctx context.Context) error {
 				return
 			}
 
+			type queuedAd struct {
+				i  int
+				ad finder_schema.Advertisement
+			}
+			adChan := make(chan queuedAd)
+
 			// SAFETY: no lock because each goroutine touches only its own index
 			entriesNested := make([][]multihash.Multihash, len(ads))
 			var wg sync.WaitGroup
-			for i, ad := range ads {
+			for i := 0; i < 16; i++ {
 				wg.Add(1)
-				go func(i int, ad finder_schema.Advertisement) {
+
+				go func() {
 					defer wg.Done()
+					for ad := range adChan {
 
-					adNode, err := ad.ToNode()
-					if err != nil {
-						log.Errorf("Failed to get ad node: %v", err)
-						return
-					}
-					var adBytes bytes.Buffer
-					if err := dagjson.Encode(adNode, &adBytes); err != nil {
-						log.Errorf("Failed to encode ad: %v", err)
-						return
-					}
-					adHash := sha256.Sum256(adBytes.Bytes())
-					adMH, _ := multihash.Encode(adHash[:16], multihash.SHA2_256)
-					adCid := cid.NewCidV1(cid.DagJSON, adMH)
+						adNode, err := ad.ad.ToNode()
+						if err != nil {
+							log.Errorf("Failed to get ad node: %v", err)
+							return
+						}
+						var adBytes bytes.Buffer
+						if err := dagjson.Encode(adNode, &adBytes); err != nil {
+							log.Errorf("Failed to encode ad: %v", err)
+							return
+						}
+						adHash := sha256.Sum256(adBytes.Bytes())
+						adMH, _ := multihash.Encode(adHash[:16], multihash.SHA2_256)
+						adCid := cid.NewCidV1(cid.DagJSON, adMH)
 
-					log.Infof("Getting entries for advertisement %s", adCid)
+						log.Infof("Getting entries for advertisement %s", adCid)
 
-					entries, err := scraper.GetEntries(ctx, syncer, lsys, ad)
-					if err != nil {
-						log.Errorf("Failed to get entries for ad %s: %v", adCid, err)
-						return
-					}
-
-					entryCount := 0
-					for entry := range entries {
-						if err := entry.Err; err != nil {
-							log.Errorf("Failed to get entry for ad: %v", err)
-							continue
+						entries, err := scraper.GetEntries(ctx, syncer, lsys, ad.ad)
+						if err != nil {
+							log.Errorf("Failed to get entries for ad %s: %v", adCid, err)
+							return
 						}
 
-						entriesNested[i] = append(entriesNested[i], entry.Entry)
+						entryCount := 0
+						for entry := range entries {
+							if err := entry.Err; err != nil {
+								log.Errorf("Failed to get entry for ad: %v", err)
+								continue
+							}
 
-						entryCount++
+							entriesNested[ad.i] = append(entriesNested[ad.i], entry.Entry)
+
+							entryCount++
+						}
+
+						log.Infof("Got %d entries for for advertisement %s (%d/%d)", entryCount, adCid, ad.i, len(ads))
 					}
-
-					log.Infof("Got %d entries for for advertisement #%d %s", entryCount, i, adCid)
-				}(i, ad)
+				}()
 			}
+
+			for i, ad := range ads {
+				adChan <- queuedAd{
+					i:  i,
+					ad: ad,
+				}
+			}
+			close(adChan)
+
 			wg.Wait()
 		}(provider)
 	}
@@ -330,22 +355,16 @@ func (scraper *Scraper) GetEntries(
 func (scraper *Scraper) GetSyncer(
 	ctx context.Context,
 	addrInfo peer.AddrInfo,
-) (syncer legs.Syncer, lsys linking.LinkSystem, closer func(), err error) {
+	lsys linking.LinkSystem,
+) (syncer legs.Syncer, closer func(), err error) {
 	// Error shorthand
-	fail := func(err error) (legs.Syncer, linking.LinkSystem, func(), error) {
+	fail := func(err error) (legs.Syncer, func(), error) {
 		// Run the closer if a syncer got successfully opened before the error
 		if closer != nil {
 			closer()
 		}
-		return nil, linking.LinkSystem{}, nil, err
+		return nil, nil, err
 	}
-
-	// Set up link system
-	lsys = cidlink.DefaultLinkSystem()
-	store := memstore.Store{}
-	lsys.SetReadStorage(&store)
-	lsys.SetWriteStorage(&store)
-	lsys.TrustedStorage = true
 
 	rl := rate.NewLimiter(rate.Inf, 0)
 
@@ -396,7 +415,7 @@ func (scraper *Scraper) GetSyncer(
 		syncer = sync.NewSyncer(addrInfo.ID, topic, rl)
 	}
 
-	return syncer, lsys, closer, nil
+	return syncer, closer, nil
 }
 
 func main() {
