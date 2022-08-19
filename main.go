@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -20,6 +22,7 @@ import (
 	"github.com/ipfs/go-datastore"
 	logging "github.com/ipfs/go-log"
 	"github.com/ipld/go-ipld-prime"
+	"github.com/ipld/go-ipld-prime/codec/dagjson"
 	"github.com/ipld/go-ipld-prime/linking"
 	cidlink "github.com/ipld/go-ipld-prime/linking/cid"
 	basicnode "github.com/ipld/go-ipld-prime/node/basic"
@@ -37,26 +40,19 @@ import (
 
 var log = logging.Logger("idxperiment")
 
-type AdvertisementResult struct {
-	Cid           cid.Cid
-	Advertisement finder_schema.Advertisement
-}
-
 // Scraper connects to providers listed by the indexer and queries their
 // advertisements
 type Scraper struct {
-	IndexerURL     string
-	Datastore      datastore.Datastore
-	Advertisements chan AdvertisementResult
-	Host           host.Host
+	IndexerURL string
+	Datastore  datastore.Datastore
+	Host       host.Host
 }
 
 func NewScraper(indexerURL string, datastore datastore.Datastore, host host.Host) (*Scraper, error) {
 	return &Scraper{
-		IndexerURL:     indexerURL,
-		Datastore:      datastore,
-		Advertisements: make(chan AdvertisementResult, 10),
-		Host:           host,
+		IndexerURL: indexerURL,
+		Datastore:  datastore,
+		Host:       host,
 	}, nil
 }
 
@@ -71,7 +67,7 @@ func (scraper *Scraper) Run(ctx context.Context) error {
 	for _, provider := range providers {
 		wg.Add(1)
 
-		func(provider finder_model.ProviderInfo) {
+		go func(provider finder_model.ProviderInfo) {
 			defer wg.Done()
 
 			log.Infof("Getting advertisements for provider %s", provider.AddrInfo.ID)
@@ -89,31 +85,52 @@ func (scraper *Scraper) Run(ctx context.Context) error {
 				return
 			}
 
-			for ad := range ads {
-				log.Infof("Getting entries for advertisement %s", ad.AdvertisementCid)
+			// SAFETY: no lock because each goroutine touches only its own index
+			entriesNested := make([][]multihash.Multihash, len(ads))
+			var wg sync.WaitGroup
+			for i, ad := range ads {
+				wg.Add(1)
+				go func(i int, ad finder_schema.Advertisement) {
+					defer wg.Done()
 
-				if err := ad.Err; err != nil {
-					log.Errorf("Failed to get ad: %v", err)
-					continue
-				}
-
-				entries, err := scraper.GetEntries(ctx, syncer, lsys, ad.Advertisement)
-				if err != nil {
-					log.Errorf("Failed to get entries for ad %s: %v", ad.AdvertisementCid, err)
-					continue
-				}
-
-				entryCount := 0
-				for entry := range entries {
-					if err := entry.Err; err != nil {
-						log.Errorf("Failed to get entry for ad: %v", err)
-						continue
+					adNode, err := ad.ToNode()
+					if err != nil {
+						log.Errorf("Failed to get ad node: %v", err)
+						return
 					}
-					entryCount++
-				}
+					var adBytes bytes.Buffer
+					if err := dagjson.Encode(adNode, &adBytes); err != nil {
+						log.Errorf("Failed to encode ad: %v", err)
+						return
+					}
+					adHash := sha256.Sum256(adBytes.Bytes())
+					adMH, _ := multihash.Encode(adHash[:16], multihash.SHA2_256)
+					adCid := cid.NewCidV1(cid.DagJSON, adMH)
 
-				log.Infof("Got %d entries for advertisement %s", entryCount, ad.AdvertisementCid)
+					log.Infof("Getting entries for advertisement %s", adCid)
+
+					entries, err := scraper.GetEntries(ctx, syncer, lsys, ad)
+					if err != nil {
+						log.Errorf("Failed to get entries for ad %s: %v", adCid, err)
+						return
+					}
+
+					entryCount := 0
+					for entry := range entries {
+						if err := entry.Err; err != nil {
+							log.Errorf("Failed to get entry for ad: %v", err)
+							continue
+						}
+
+						entriesNested[i] = append(entriesNested[i], entry.Entry)
+
+						entryCount++
+					}
+
+					log.Infof("Got %d entries for for advertisement #%d %s", entryCount, i, adCid)
+				}(i, ad)
 			}
+			wg.Wait()
 		}(provider)
 	}
 	wg.Wait()
@@ -142,14 +159,6 @@ func (scraper *Scraper) GetProviders(ctx context.Context) ([]finder_model.Provid
 	return providers, nil
 }
 
-type GetAdvertisementsResult struct {
-	Advertisement    finder_schema.Advertisement
-	AdvertisementCid cid.Cid
-
-	// If non-nil, other values are invalid
-	Err error
-}
-
 // Get advertisements in order starting from the genesis; has to load all the
 // ads starting from the most recent and reverse them
 func (scraper *Scraper) GetAdvertisements(
@@ -157,9 +166,9 @@ func (scraper *Scraper) GetAdvertisements(
 	syncer legs.Syncer,
 	lsys ipld.LinkSystem,
 	provider finder_model.ProviderInfo,
-) (<-chan GetAdvertisementsResult, error) {
+) ([]finder_schema.Advertisement, error) {
 	// Error shorthand
-	fail := func(err error) (<-chan GetAdvertisementsResult, error) {
+	fail := func(err error) ([]finder_schema.Advertisement, error) {
 		return nil, err
 	}
 
@@ -190,73 +199,52 @@ func (scraper *Scraper) GetAdvertisements(
 	}
 	log.Infof("Done syncing")
 
-	// Advertisements stored from most recent (reverse of required order)
-	var adsReverse []GetAdvertisementsResult
+	var adsReverse []finder_schema.Advertisement
+	for queuedAdvertisement.Cid != cid.Undef {
 
-	adsChan := make(chan GetAdvertisementsResult, 10)
-	go func() {
-		defer close(adsChan)
+		log.Debugf("Reading advertisement %s from %s", queuedAdvertisement, provider.AddrInfo.ID)
 
-		// Goroutine error shorthand
-		sendFail := func(err error) {
-			adsChan <- GetAdvertisementsResult{
-				Err: err,
-			}
+		if err := ctx.Err(); err != nil {
+			return fail(err)
 		}
 
-		for queuedAdvertisement.Cid != cid.Undef {
-
-			log.Debugf("Reading advertisement %s from %s", queuedAdvertisement, provider.AddrInfo.ID)
-
-			if err := ctx.Err(); err != nil {
-				sendFail(err)
-				break
-			}
-
-			adNode, err := lsys.Load(ipld.LinkContext{}, queuedAdvertisement, basicnode.Prototype.Any)
-			if err != nil {
-				sendFail(fmt.Errorf("failed to load advertisement: %w", err))
-				break
-			}
-
-			ad, err := finder_schema.UnwrapAdvertisement(adNode)
-			if err != nil {
-				sendFail(fmt.Errorf("failed to unwrap advertisement: %w", err))
-				break
-			}
-
-			log.Infof("Adding ad CID: %s", queuedAdvertisement.Cid)
-			adsReverse = append(adsReverse, GetAdvertisementsResult{
-				Advertisement:    *ad,
-				AdvertisementCid: queuedAdvertisement.Cid,
-			})
-
-			if ad.PreviousID == nil {
-				log.Debugf("Got to genesis advertisement for provider: %s", provider.AddrInfo.ID)
-				break
-			}
-
-			previousIDLink := *ad.PreviousID
-			if previousIDCidLink, ok := previousIDLink.(cidlink.Link); ok {
-				// oldQueuedAdvertisement = queuedAdvertisement
-				queuedAdvertisement = previousIDCidLink
-
-				if queuedAdvertisement.Cid == cid.Undef {
-					break
-				}
-			} else {
-				sendFail(fmt.Errorf("previous ID wasn't a CID link"))
-				break
-			}
+		adNode, err := lsys.Load(ipld.LinkContext{}, queuedAdvertisement, basicnode.Prototype.Any)
+		if err != nil {
+			return fail(fmt.Errorf("failed to load advertisement: %w", err))
 		}
 
-		// Send ads from end to beginning
-		for i := len(adsReverse) - 1; i >= 0; i-- {
-			adsChan <- adsReverse[i]
+		ad, err := finder_schema.UnwrapAdvertisement(adNode)
+		if err != nil {
+			return fail(fmt.Errorf("failed to unwrap advertisement: %w", err))
 		}
-	}()
 
-	return adsChan, nil
+		log.Infof("Adding ad CID: %s", queuedAdvertisement.Cid)
+		adsReverse = append(adsReverse, *ad)
+
+		if ad.PreviousID == nil {
+			log.Debugf("Got to genesis advertisement for provider: %s", provider.AddrInfo.ID)
+			break
+		}
+
+		previousIDLink := *ad.PreviousID
+		if previousIDCidLink, ok := previousIDLink.(cidlink.Link); ok {
+			queuedAdvertisement = previousIDCidLink
+
+			if queuedAdvertisement.Cid == cid.Undef {
+				break
+			}
+		} else {
+			return fail(fmt.Errorf("previous ID wasn't a CID link"))
+		}
+	}
+
+	// Flip ads into correct order
+	ads := make([]finder_schema.Advertisement, len(adsReverse))
+	for i, ad := range adsReverse {
+		ads[len(adsReverse)-i-1] = ad
+	}
+
+	return ads, nil
 }
 
 type GetEntriesResult struct {
