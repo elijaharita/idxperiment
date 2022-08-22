@@ -236,9 +236,13 @@ func (scraper *Scraper) GetAdvertisements(
 	queuedAdvertisement := cidlink.Link{Cid: headCid}
 
 	log.Infof("Syncing...")
-	if err := syncer.Sync(ctx, queuedAdvertisement.Cid, adSelector); err != nil {
+	// TODO: more intelligent timeout setup
+	syncCtx, syncCancel := context.WithTimeout(ctx, time.Minute)
+	if err := syncer.Sync(syncCtx, queuedAdvertisement.Cid, adSelector); err != nil {
+		syncCancel()
 		return fail(fmt.Errorf("failed to sync: %w", err))
 	}
+	syncCancel()
 	log.Infof("Done syncing")
 
 	var adsReverse []finder_schema.Advertisement
