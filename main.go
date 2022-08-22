@@ -441,7 +441,7 @@ func main() {
 
 	datastore := safemapds.NewMapDatastore()
 
-	host, err := libp2p.New(libp2p.DisableRelay())
+	host, err := libp2p.New(libp2p.DisableRelay(), libp2p.ResourceManager(nil))
 	if err != nil {
 		log.Fatal(err)
 	}
