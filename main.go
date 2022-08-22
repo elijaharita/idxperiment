@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base32"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -26,7 +27,7 @@ import (
 	"github.com/ipld/go-ipld-prime/linking"
 	cidlink "github.com/ipld/go-ipld-prime/linking/cid"
 	basicnode "github.com/ipld/go-ipld-prime/node/basic"
-	"github.com/ipld/go-ipld-prime/storage/memstore"
+	"github.com/ipld/go-ipld-prime/storage/dsadapter"
 	"github.com/ipld/go-ipld-prime/traversal/selector"
 	"github.com/ipld/go-ipld-prime/traversal/selector/builder"
 	"github.com/libp2p/go-libp2p"
@@ -46,13 +47,27 @@ type Scraper struct {
 	IndexerURL string
 	Datastore  datastore.Datastore
 	Host       host.Host
+	LinkSystem ipld.LinkSystem
 }
 
 func NewScraper(indexerURL string, datastore datastore.Datastore, host host.Host) (*Scraper, error) {
+	// Set up link system
+	lsys := cidlink.DefaultLinkSystem()
+	store := &dsadapter.Adapter{
+		Wrapped: datastore,
+		EscapingFunc: func(raw string) string {
+			return base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString([]byte(raw))
+		},
+	}
+	lsys.SetReadStorage(store)
+	lsys.SetWriteStorage(store)
+	lsys.TrustedStorage = true
+
 	return &Scraper{
 		IndexerURL: indexerURL,
 		Datastore:  datastore,
 		Host:       host,
+		LinkSystem: lsys,
 	}, nil
 }
 
@@ -63,13 +78,6 @@ func (scraper *Scraper) Run(ctx context.Context) error {
 		return err
 	}
 
-	// Set up link system
-	lsys := cidlink.DefaultLinkSystem()
-	store := memstore.Store{}
-	lsys.SetReadStorage(&store)
-	lsys.SetWriteStorage(&store)
-	lsys.TrustedStorage = true
-
 	var wg sync.WaitGroup
 	for _, provider := range providers {
 		wg.Add(1)
@@ -79,7 +87,7 @@ func (scraper *Scraper) Run(ctx context.Context) error {
 
 			log.Infof("Getting advertisements for provider %s", provider.AddrInfo.ID)
 
-			syncer, closer, err := scraper.GetSyncer(ctx, provider.AddrInfo, lsys)
+			syncer, closer, err := scraper.GetSyncer(ctx, provider.AddrInfo, scraper.LinkSystem)
 			if err != nil {
 				log.Errorf("Could not get syncer for provider %s: %v", provider.AddrInfo.ID, err)
 				return
@@ -88,7 +96,7 @@ func (scraper *Scraper) Run(ctx context.Context) error {
 
 			// SAFETY: ads is read-only after this point and needs no lock - do
 			// not write to it
-			ads, err := scraper.GetAdvertisements(ctx, syncer, lsys, provider)
+			ads, err := scraper.GetAdvertisements(ctx, syncer, scraper.LinkSystem, provider)
 			if err != nil {
 				log.Errorf("Could not get advertisements for provider %s: %v", provider.AddrInfo.ID, err)
 				return
@@ -141,7 +149,7 @@ func (scraper *Scraper) Run(ctx context.Context) error {
 						maxAttempts := 5
 						for i := 1; i <= maxAttempts; i++ {
 							log.Infof("Getting entries for advertisement %s (attempt %d/%d)", adCid, i, maxAttempts)
-							_entries, err := scraper.GetEntries(threadsCtx, syncer, lsys, ad)
+							_entries, err := scraper.GetEntries(threadsCtx, syncer, scraper.LinkSystem, ad)
 							if err != nil {
 								log.Errorf("Failed to get entries for ad %s: %v", adCid, err)
 								if i == maxAttempts {

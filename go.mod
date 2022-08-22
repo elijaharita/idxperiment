@@ -9,9 +9,11 @@ require (
 	github.com/ipfs/go-datastore v0.5.1
 	github.com/ipfs/go-log v1.0.5
 	github.com/ipld/go-ipld-prime v0.18.0
+	github.com/ipld/go-ipld-prime/storage/dsadapter v0.0.0-20220818231130-03760d604f6b
 	github.com/libp2p/go-libp2p v0.20.3
 	github.com/libp2p/go-libp2p-core v0.16.1
 	github.com/multiformats/go-multiaddr v0.5.0
+	github.com/multiformats/go-multihash v0.2.0
 	github.com/willscott/index-observer v0.0.0-20220424093649-f652e3201762
 	golang.org/x/time v0.0.0-20210723032227-1f47c861a9ac
 )
@@ -108,7 +110,6 @@ require (
 	github.com/miekg/dns v1.1.48 // indirect
 	github.com/mikioh/tcpinfo v0.0.0-20190314235526-30a79bb1804b // indirect
 	github.com/mikioh/tcpopt v0.0.0-20190314235656-172688c1accc // indirect
-	github.com/minio/blake2b-simd v0.0.0-20160723061019-3f5f724cb5b1 // indirect
 	github.com/minio/sha256-simd v1.0.0 // indirect
 	github.com/mr-tron/base58 v1.2.0 // indirect
 	github.com/multiformats/go-base32 v0.0.4 // indirect
@@ -117,7 +118,6 @@ require (
 	github.com/multiformats/go-multiaddr-fmt v0.1.0 // indirect
 	github.com/multiformats/go-multibase v0.0.3 // indirect
 	github.com/multiformats/go-multicodec v0.5.0 // indirect
-	github.com/multiformats/go-multihash v0.2.0 // indirect
 	github.com/multiformats/go-multistream v0.3.3 // indirect
 	github.com/multiformats/go-varint v0.0.6 // indirect
 	github.com/nxadm/tail v1.4.8 // indirect
