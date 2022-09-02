@@ -6,10 +6,10 @@ require (
 	github.com/filecoin-project/go-legs v0.4.9
 	github.com/filecoin-project/storetheindex v0.4.17
 	github.com/ipfs/go-cid v0.2.0
-	github.com/ipfs/go-datastore v0.5.1
+	github.com/ipfs/go-datastore v0.6.0
 	github.com/ipfs/go-log v1.0.5
 	github.com/ipld/go-ipld-prime v0.18.0
-	github.com/ipld/go-ipld-prime/storage/dsadapter v0.0.0-20220818231130-03760d604f6b
+	github.com/ipld/go-ipld-prime/storage/dsadapter v0.0.0-20220825062601-8fd3dea583cd
 	github.com/libp2p/go-libp2p v0.20.3
 	github.com/libp2p/go-libp2p-core v0.16.1
 	github.com/multiformats/go-multiaddr v0.5.0
