@@ -110,34 +110,37 @@ func main() {
 				lk.Unlock()
 
 				func() {
-					connectCtx, connectCancel := context.WithTimeout(ctx, time.Second*10)
-					handle, err := scraper.NewProviderHandle(connectCtx, provider)
+					syncCtx, syncCancel := context.WithCancel(ctx)
+					syncTimer := time.AfterFunc(time.Minute, func() {
+						log.Infof("Sync timed out for %s, attempting to cancel", provider.AddrInfo.ID)
+						syncCancel()
+					})
+
+					handle, err := scraper.NewProviderHandle(syncCtx, provider)
 					if err != nil {
 						log.Error(err)
-						connectCancel()
+						syncCancel()
 						return
 					}
-					connectCancel()
 
 					log.Infof("Syncing ads for %s", provider.AddrInfo.ID)
-					syncCtx, syncCancel := context.WithTimeout(ctx, time.Minute)
 					lastAd, err := handle.syncAds(syncCtx)
 					if err != nil {
 						log.Error(err)
 						syncCancel()
 						return
 					}
-					syncCancel()
 
 					log.Infof("Loading ads for %s", provider.AddrInfo.ID)
-					loadCtx, loadCancel := context.WithTimeout(ctx, time.Second*10)
-					ads, err := handle.loadAds(loadCtx, lastAd)
+					ads, err := handle.loadAds(syncCtx, lastAd)
 					if err != nil {
 						log.Error(err)
-						loadCancel()
+						syncCancel()
 						return
 					}
-					loadCancel()
+
+					syncTimer.Stop()
+					syncCancel()
 
 					lk.Lock()
 					successCount++
