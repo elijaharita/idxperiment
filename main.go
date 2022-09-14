@@ -119,6 +119,7 @@ func main() {
 					handle, err := scraper.NewProviderHandle(syncCtx, provider)
 					if err != nil {
 						log.Error(err)
+						syncTimer.Stop()
 						syncCancel()
 						return
 					}
@@ -127,6 +128,7 @@ func main() {
 					lastAd, err := handle.syncAds(syncCtx)
 					if err != nil {
 						log.Error(err)
+						syncTimer.Stop()
 						syncCancel()
 						return
 					}
@@ -135,6 +137,7 @@ func main() {
 					ads, err := handle.loadAds(syncCtx, lastAd)
 					if err != nil {
 						log.Error(err)
+						syncTimer.Stop()
 						syncCancel()
 						return
 					}
@@ -267,20 +270,34 @@ func (scraper *Scraper) NewProviderHandle(
 	ctx context.Context,
 	provider finder_model.ProviderInfo,
 ) (*ProviderHandle, error) {
-	var closer func()
-
-	// Error shorthand
-	fail := func(err error) (*ProviderHandle, error) {
-		// Run the closer if a syncer got successfully opened before the error
-		if closer != nil {
-			closer()
-		}
-		return nil, err
-	}
-
 	// Namespaced logger
 	namespace := provider.AddrInfo.ID.String()
 	log := log.Named("handle").Named(namespace[len(namespace)-5:])
+
+	log.Debugf("Created new provider handle for %s", provider.AddrInfo.ID)
+
+	return &ProviderHandle{
+		scraper:  scraper,
+		provider: provider,
+		info:     provider,
+		log:      log,
+	}, nil
+}
+
+// A handle allowing communication with a specific provider - must be closed
+// when done
+type ProviderHandle struct {
+	scraper  *Scraper
+	provider finder_model.ProviderInfo
+	info     finder_model.ProviderInfo
+	log      *zap.SugaredLogger
+}
+
+func (handle *ProviderHandle) syncer(ctx context.Context) (legs.Syncer, error) {
+	// Error shorthand
+	fail := func(err error) (legs.Syncer, error) {
+		return nil, err
+	}
 
 	var syncer legs.Syncer
 
@@ -288,51 +305,35 @@ func (scraper *Scraper) NewProviderHandle(
 
 	// Open either HTTP or DataTransfer syncer depending on addrInfo's supported
 	// protocols
-	if isHTTP(provider.AddrInfo) {
-		log.Debugf("Connecting to %s using httpsync", provider.AddrInfo.ID)
+	if isHTTP(handle.provider.AddrInfo) {
+		log.Debugf("Connecting to %s using httpsync", handle.provider.AddrInfo.ID)
 
-		_syncer, err := scraper.httpSync.NewSyncer(provider.AddrInfo.ID, provider.AddrInfo.Addrs[0], rl)
+		_syncer, err := handle.scraper.httpSync.NewSyncer(handle.provider.AddrInfo.ID, handle.provider.AddrInfo.Addrs[0], rl)
 		if err != nil {
 			return fail(fmt.Errorf("could not create http syncer: %w", err))
 		}
 
 		syncer = _syncer
 	} else {
-		log.Debugf("Connecting to %s using dtsync", provider.AddrInfo.ID)
+		log.Debugf("Connecting to %s using dtsync", handle.provider.AddrInfo.ID)
 
-		scraper.host.Peerstore().AddAddrs(provider.AddrInfo.ID, provider.AddrInfo.Addrs, time.Hour*24*7)
+		handle.scraper.host.Peerstore().AddAddrs(handle.provider.AddrInfo.ID, handle.provider.AddrInfo.Addrs, time.Hour*24*7)
 
-		if err := scraper.host.Connect(ctx, provider.AddrInfo); err != nil {
+		if err := handle.scraper.host.Connect(ctx, handle.provider.AddrInfo); err != nil {
 			return fail(fmt.Errorf("failed to connect to host: %w", err))
 		}
 
-		protos, err := scraper.host.Peerstore().GetProtocols(provider.AddrInfo.ID)
+		protos, err := handle.scraper.host.Peerstore().GetProtocols(handle.provider.AddrInfo.ID)
 		if err != nil {
 			return fail(fmt.Errorf("could not get protocols: %w", err))
 		}
 
 		topic := topicFromSupportedProtocols(protos)
 
-		syncer = scraper.dtSync.NewSyncer(provider.AddrInfo.ID, topic, rl)
+		syncer = handle.scraper.dtSync.NewSyncer(handle.provider.AddrInfo.ID, topic, rl)
 	}
 
-	log.Debugf("Created new provider handle for %s", provider.AddrInfo.ID)
-
-	return &ProviderHandle{
-		scraper: scraper,
-		syncer:  syncer,
-		info:    provider,
-		log:     log,
-	}, nil
-}
-
-// A handle allowing communication with a specific provider - must be closed
-// when done
-type ProviderHandle struct {
-	scraper *Scraper
-	syncer  legs.Syncer
-	info    finder_model.ProviderInfo
-	log     *zap.SugaredLogger
+	return syncer, nil
 }
 
 // Recursively syncs all ads from last to first, returning the last ad cid on
@@ -353,12 +354,20 @@ func (handle *ProviderHandle) syncAds(ctx context.Context) (cid.Cid, error) {
 	).Node()
 
 	// Start with the last advertisement
-	lastAd, err := handle.syncer.GetHead(ctx)
+	syncer, err := handle.syncer(ctx)
+	if err != nil {
+		return cid.Undef, err
+	}
+	lastAd, err := syncer.GetHead(ctx)
 	if err != nil {
 		return fail(fmt.Errorf("syncer could not get advertisements head: %v", err))
 	}
 
-	if err := handle.syncer.Sync(ctx, lastAd, adsSelector); err != nil {
+	syncer, err = handle.syncer(ctx)
+	if err != nil {
+		return cid.Undef, err
+	}
+	if err := syncer.Sync(ctx, lastAd, adsSelector); err != nil {
 		return fail(fmt.Errorf("failed to sync advertisements: %v", err))
 	}
 
