@@ -86,9 +86,14 @@ func main() {
 	index := 0
 	var lk sync.Mutex
 	var wg sync.WaitGroup
+	threadCount := 0
 
 	for i := 0; i < 20; i++ {
 		wg.Add(1)
+
+		lk.Lock()
+		threadCount++
+		lk.Unlock()
 
 		go func() {
 			defer wg.Done()
@@ -142,6 +147,11 @@ func main() {
 					lk.Unlock()
 				}()
 			}
+
+			lk.Lock()
+			threadCount--
+			log.Infof("Thread finished (%d remaining)", threadCount)
+			lk.Unlock()
 		}()
 	}
 
