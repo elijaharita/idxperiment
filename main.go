@@ -2,15 +2,20 @@ package main
 
 import (
 	"context"
-	"encoding/base32"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
 	"regexp"
+	"sync"
 	"time"
 
+	datatransfer "github.com/filecoin-project/go-data-transfer"
+	dtimpl "github.com/filecoin-project/go-data-transfer/impl"
+	dtnet "github.com/filecoin-project/go-data-transfer/network"
+	dtgs "github.com/filecoin-project/go-data-transfer/transport/graphsync"
 	"github.com/filecoin-project/go-legs"
 	"github.com/filecoin-project/go-legs/dtsync"
 	"github.com/filecoin-project/go-legs/httpsync"
@@ -18,19 +23,23 @@ import (
 	finder_schema "github.com/filecoin-project/storetheindex/api/v0/ingest/schema"
 	"github.com/ipfs/go-cid"
 	"github.com/ipfs/go-datastore"
+	flatfs "github.com/ipfs/go-ds-flatfs"
+	leveldb "github.com/ipfs/go-ds-leveldb"
+	"github.com/ipfs/go-graphsync"
+	gsimpl "github.com/ipfs/go-graphsync/impl"
+	gsnet "github.com/ipfs/go-graphsync/network"
+	"github.com/ipfs/go-graphsync/storeutil"
+	blockstore "github.com/ipfs/go-ipfs-blockstore"
 	logging "github.com/ipfs/go-log"
 	"github.com/ipld/go-ipld-prime"
 	cidlink "github.com/ipld/go-ipld-prime/linking/cid"
 	"github.com/ipld/go-ipld-prime/node/basicnode"
-	"github.com/ipld/go-ipld-prime/storage/dsadapter"
 	"github.com/ipld/go-ipld-prime/traversal/selector"
 	"github.com/ipld/go-ipld-prime/traversal/selector/builder"
 	"github.com/libp2p/go-libp2p"
 	host "github.com/libp2p/go-libp2p-core"
 	peer "github.com/libp2p/go-libp2p-core/peer"
 	"github.com/multiformats/go-multiaddr"
-	"github.com/multiformats/go-multihash"
-	"github.com/willscott/index-observer/safemapds"
 	"go.uber.org/zap"
 	"golang.org/x/time/rate"
 )
@@ -40,73 +49,159 @@ var log = logging.Logger("idxperiment")
 func main() {
 	logging.SetLogLevel("idxperiment", "debug")
 
-	datastore := safemapds.NewMapDatastore()
+	if err := os.MkdirAll("data", 0755); err != nil {
+		log.Fatal(err)
+	}
 
-	host, err := libp2p.New(libp2p.DisableRelay(), libp2p.ResourceManager(nil))
+	ds, err := leveldb.NewDatastore("data/datastore", nil)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	scraper, err := NewScraper("https://cid.contact", datastore, host)
+	bsDS, err := flatfs.CreateOrOpen("data/blockstore", flatfs.NextToLast(3), true)
+	if err != nil {
+		log.Fatal(err)
+	}
+	bs := blockstore.NewBlockstoreNoPrefix(bsDS)
+
+	h, err := libp2p.New(libp2p.DisableRelay(), libp2p.ResourceManager(nil), libp2p.WithDialTimeout(time.Second*5))
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	ctx := context.Background()
 
+	scraper, err := NewScraper(ctx, "https://cid.contact", bs, ds, h)
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	providers, err := scraper.GetProviders(ctx)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	handle, err := scraper.NewProviderHandle(ctx, providers[0])
-	if err != nil {
-		log.Fatal(err)
+	startTime := time.Now()
+	successCount := 0
+	index := 0
+	var lk sync.Mutex
+	var wg sync.WaitGroup
+
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+
+		go func() {
+			for {
+				lk.Lock()
+				if index >= len(providers) {
+					lk.Unlock()
+					break
+				}
+				provider := providers[index]
+				log.Infof("Getting ad chain from provider %s (%d/%d)", provider.AddrInfo.ID, index, len(providers))
+				index++
+
+				lk.Unlock()
+
+				func() {
+					handle, err := scraper.NewProviderHandle(ctx, provider)
+					if err != nil {
+						log.Error(err)
+						return
+					}
+
+					defer handle.Close()
+
+					log.Infof("Syncing ads for %s", provider.AddrInfo.ID)
+					syncCtx, syncCancel := context.WithTimeout(ctx, time.Minute)
+					lastAd, err := handle.syncAds(syncCtx)
+					if err != nil {
+						log.Error(err)
+						syncCancel()
+						return
+					}
+					syncCancel()
+
+					log.Infof("Loading ads for %s", provider.AddrInfo.ID)
+					ads, err := handle.loadAds(ctx, lastAd)
+					if err != nil {
+						log.Error(err)
+						return
+					}
+
+					lk.Lock()
+					successCount++
+					log.Infof("Got %d ads from %s", len(ads), provider.AddrInfo.ID)
+					lk.Unlock()
+				}()
+			}
+
+			wg.Done()
+		}()
 	}
 
-	entries, err := handle.GetEntries(ctx)
-	if err != nil {
-		log.Fatal(err)
-	}
+	wg.Wait()
 
-	for entry := range entries {
-		if err := entry.Error; err != nil {
-			log.Fatalf("Failed to get entry: %v", err)
-		}
-
-		// log.Infof("Entry: %#v", entry)
-	}
+	log.Infof("Finished indexing after %s", time.Since(startTime))
+	log.Infof(
+		"Successes: %d | Failures: %d | Success Rate: %f%%",
+		successCount,
+		len(providers)-successCount,
+		float32(successCount)/float32(len(providers)),
+	)
 }
 
 type Scraper struct {
-	indexerURL string
-	datastore  datastore.Datastore
-	host       host.Host
-	linkSystem ipld.LinkSystem
+	indexerURL   string
+	blockstore   blockstore.Blockstore
+	datastore    datastore.Batching
+	host         host.Host
+	linkSystem   ipld.LinkSystem
+	dataTransfer datatransfer.Manager
+	gsExchange   graphsync.GraphExchange
 }
 
 func NewScraper(
+	ctx context.Context,
 	indexerURL string,
-	datastore datastore.Datastore,
-	host host.Host,
+	bs blockstore.Blockstore,
+	ds datastore.Batching,
+	h host.Host,
 ) (*Scraper, error) {
 	// Set up link system
-	lsys := cidlink.DefaultLinkSystem()
-	store := &dsadapter.Adapter{
-		Wrapped: datastore,
-		EscapingFunc: func(raw string) string {
-			return base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString([]byte(raw))
-		},
+	lsys := storeutil.LinkSystemForBlockstore(bs)
+
+	dtNetwork := dtnet.NewFromLibp2pHost(h)
+	gsNetwork := gsnet.NewFromLibp2pHost(h)
+	gsExchange := gsimpl.New(
+		ctx,
+		gsNetwork,
+		lsys,
+		gsimpl.MaxInProgressIncomingRequests(100),
+		gsimpl.MaxMemoryResponder(8<<30),
+		gsimpl.MaxMemoryPerPeerResponder(1<<30),
+		gsimpl.SendMessageTimeout(time.Second*10),
+		gsimpl.MessageSendRetries(2),
+	)
+	gsTransport := dtgs.NewTransport(h.ID(), gsExchange)
+
+	dt, err := dtimpl.NewDataTransfer(ds, dtNetwork, gsTransport)
+	if err != nil {
+		return nil, err
 	}
-	lsys.SetReadStorage(store)
-	lsys.SetWriteStorage(store)
-	lsys.TrustedStorage = true
+
+	if err := dt.Start(ctx); err != nil {
+		return nil, err
+	}
 
 	return &Scraper{
-		indexerURL: indexerURL,
-		datastore:  datastore,
-		host:       host,
-		linkSystem: lsys,
+		indexerURL:   indexerURL,
+		blockstore:   bs,
+		datastore:    ds,
+		host:         h,
+		linkSystem:   lsys,
+		dataTransfer: dt,
+		gsExchange:   gsExchange,
 	}, nil
 }
 
@@ -175,14 +270,17 @@ func (scraper *Scraper) NewProviderHandle(
 
 		scraper.host.Peerstore().AddAddrs(provider.AddrInfo.ID, provider.AddrInfo.Addrs, time.Hour*24*7)
 
-		ds := safemapds.NewMapDatastore()
-
 		if err := scraper.host.Connect(ctx, provider.AddrInfo); err != nil {
 			return fail(fmt.Errorf("failed to connect to host: %w", err))
 		}
 		scraper.host.ConnManager().Protect(provider.AddrInfo.ID, "scraper")
 
-		sync, err := dtsync.NewSync(scraper.host, ds, scraper.linkSystem, func(i peer.ID, c cid.Cid) {})
+		sync, err := dtsync.NewSyncWithDT(
+			scraper.host,
+			scraper.dataTransfer,
+			scraper.gsExchange,
+			func(i peer.ID, c cid.Cid) {},
+		)
 		if err != nil {
 			return fail(fmt.Errorf("could not create datastore: %w", err))
 		}
@@ -204,7 +302,7 @@ func (scraper *Scraper) NewProviderHandle(
 	log.Debugf("Created new provider handle for %s", provider.AddrInfo.ID)
 
 	return &ProviderHandle{
-		Scraper: scraper,
+		scraper: scraper,
 		syncer:  syncer,
 		info:    provider,
 		Close:   closer,
@@ -212,100 +310,14 @@ func (scraper *Scraper) NewProviderHandle(
 	}, nil
 }
 
-type EntryResult struct {
-	// If non-nil, other members are invalid
-	Error error
-
-	Multihash multihash.Multihash
-	Remove    bool
-}
-
 // A handle allowing communication with a specific provider - must be closed
 // when done
 type ProviderHandle struct {
-	*Scraper
-	Close  func()
-	syncer legs.Syncer
-	info   finder_model.ProviderInfo
-	log    *zap.SugaredLogger
-}
-
-// Internally starts a goroutine to retrieve every entry (in order) from the
-// provider - there may be multiple entries for a single multihash in case it
-// was added and subsequently removed
-//
-// The context will be respected in the goroutine even after GetEntries() itself
-// returns, so it should not be cancelled until the returned channel is closed
-// and drained, or early stop is truly intended
-func (handle *ProviderHandle) GetEntries(
-	ctx context.Context,
-) (<-chan EntryResult, error) {
-	// Error shorthand
-	fail := func(err error) (<-chan EntryResult, error) {
-		return nil, err
-	}
-
-	log := handle.log
-
-	log.Debugf("Loading advertisements")
-
-	// Sync and load ads
-	lastAdCid, err := handle.syncAds(ctx)
-	if err != nil {
-		return fail(err)
-	}
-	ads, err := handle.loadAds(ctx, lastAdCid)
-	if err != nil {
-		return fail(err)
-	}
-
-	// For each advertisement, sync and load its entries and push them to the
-	// results channel
-
-	log.Debugf("Getting entries for %d ads", len(ads))
-
-	results := make(chan EntryResult)
-	go func() error {
-		defer close(results)
-
-		// Goroutine error shorthand
-		sendFail := func(err error) error {
-			results <- EntryResult{
-				Error: err,
-			}
-			return err
-		}
-
-		for i, ad := range ads {
-			log.Debugf("Getting entries for ad %d", i)
-
-			firstEntryChunkCid, err := handle.syncEntryChunks(ctx, ad)
-			if err != nil {
-				return sendFail(err)
-			}
-
-			entryChunks := handle.loadEntryChunks(ctx, firstEntryChunkCid)
-
-			for entryChunk := range entryChunks {
-				// If there's an error getting an entry chunk, fail early
-				if err := entryChunk.Error; err != nil {
-					return sendFail(err)
-				}
-
-				// Forward each of the entries to the results chan
-				for _, entry := range entryChunk.Entries {
-					results <- EntryResult{
-						Multihash: entry,
-						Remove:    ad.IsRm,
-					}
-				}
-			}
-		}
-
-		return nil
-	}()
-
-	return results, nil
+	scraper *Scraper
+	Close   func()
+	syncer  legs.Syncer
+	info    finder_model.ProviderInfo
+	log     *zap.SugaredLogger
 }
 
 // Recursively syncs all ads from last to first, returning the last ad cid on
@@ -361,7 +373,7 @@ func (handle *ProviderHandle) loadAds(
 		// Load the current advertisement node
 		//
 		// TODO: specific prototype?
-		adNode, err := handle.linkSystem.Load(
+		adNode, err := handle.scraper.linkSystem.Load(
 			ipld.LinkContext{},
 			cidlink.Link{Cid: currAdCid},
 			basicnode.Prototype.Any,
@@ -398,96 +410,6 @@ func (handle *ProviderHandle) loadAds(
 	}
 
 	return ads, nil
-}
-
-// Recursively syncs all entry chunks in a chain, returning first entry chunk
-// cid on success
-func (handle *ProviderHandle) syncEntryChunks(ctx context.Context, ad finder_schema.Advertisement) (cid.Cid, error) {
-	// Error shorthand
-	fail := func(err error) (cid.Cid, error) {
-		return cid.Undef, err
-	}
-
-	firstEntry := ad.Entries.(cidlink.Link).Cid
-
-	// TODO: specific prototype?
-	entriesSSB := builder.NewSelectorSpecBuilder(basicnode.Prototype.Any)
-	entriesSelector := entriesSSB.ExploreRecursive(
-		selector.RecursionLimitNone(),
-		entriesSSB.ExploreFields(func(efsb builder.ExploreFieldsSpecBuilder) {
-			efsb.Insert("Entries", entriesSSB.ExploreAll(entriesSSB.Matcher()))
-			efsb.Insert("Next", entriesSSB.ExploreRecursiveEdge())
-		}),
-	).Node()
-
-	if err := handle.syncer.Sync(ctx, firstEntry, entriesSelector); err != nil {
-		return fail(fmt.Errorf("failed to sync entries: %v", err))
-	}
-
-	return firstEntry, nil
-}
-
-type EntryChunkResult struct {
-	finder_schema.EntryChunk
-
-	// If non-nil, other fields are invalid
-	Error error
-}
-
-// Context will be respected until the returned channel has been closed, the
-// passed context should not be cancelled until completion or early stop is
-// desired
-func (handle *ProviderHandle) loadEntryChunks(
-	ctx context.Context,
-	firstEntryChunk cid.Cid,
-) <-chan EntryChunkResult {
-	entryChunks := make(chan EntryChunkResult, 10)
-
-	currEntryChunk := firstEntryChunk
-
-	go func() error {
-		defer close(entryChunks)
-
-		// Goroutine error shorthand
-		sendFail := func(err error) error {
-			entryChunks <- EntryChunkResult{
-				Error: err,
-			}
-			return err
-		}
-
-		for currEntryChunk != cid.Undef {
-			entryChunkNode, err := handle.linkSystem.Load(
-				ipld.LinkContext{},
-				cidlink.Link{Cid: currEntryChunk},
-				basicnode.Prototype.Any,
-			)
-			if err != nil {
-				return sendFail(fmt.Errorf("failed to load entries node %v: %v", currEntryChunk, err))
-			}
-
-			entryChunk, err := finder_schema.UnwrapEntryChunk(entryChunkNode)
-			if err != nil {
-				return sendFail(fmt.Errorf("failed to unwrap entry chunk: %v", err))
-			}
-
-			entryChunks <- EntryChunkResult{
-				EntryChunk: *entryChunk,
-			}
-
-			if entryChunk.Next == nil {
-				currEntryChunk = cid.Undef
-			} else if nextEntryChunkToProcess, ok := (*entryChunk.Next).(cidlink.Link); ok {
-				currEntryChunk = nextEntryChunkToProcess.Cid
-			} else {
-				return sendFail(fmt.Errorf("next entry chunk wasn't a CID link"))
-			}
-		}
-
-		return nil
-	}()
-
-	return entryChunks
 }
 
 func isHTTP(p peer.AddrInfo) bool {
