@@ -119,8 +119,6 @@ func main() {
 					}
 					connectCancel()
 
-					defer handle.Close()
-
 					log.Infof("Syncing ads for %s", provider.AddrInfo.ID)
 					syncCtx, syncCancel := context.WithTimeout(ctx, time.Minute)
 					lastAd, err := handle.syncAds(syncCtx)
@@ -174,6 +172,8 @@ type Scraper struct {
 	linkSystem   ipld.LinkSystem
 	dataTransfer datatransfer.Manager
 	gsExchange   graphsync.GraphExchange
+	dtSync       *dtsync.Sync
+	httpSync     *httpsync.Sync
 }
 
 func NewScraper(
@@ -209,6 +209,18 @@ func NewScraper(
 		return nil, err
 	}
 
+	httpSync := httpsync.NewSync(lsys, &http.Client{}, func(i peer.ID, c cid.Cid) {})
+
+	dtSync, err := dtsync.NewSyncWithDT(
+		h,
+		dt,
+		gsExchange,
+		func(i peer.ID, c cid.Cid) {},
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Scraper{
 		indexerURL:   indexerURL,
 		blockstore:   bs,
@@ -217,7 +229,14 @@ func NewScraper(
 		linkSystem:   lsys,
 		dataTransfer: dt,
 		gsExchange:   gsExchange,
+		httpSync:     httpSync,
+		dtSync:       dtSync,
 	}, nil
+}
+
+func (scraper *Scraper) Close() {
+	scraper.dtSync.Close()
+	scraper.httpSync.Close()
 }
 
 func (scraper *Scraper) GetProviders(ctx context.Context) ([]finder_model.ProviderInfo, error) {
@@ -269,12 +288,7 @@ func (scraper *Scraper) NewProviderHandle(
 	if isHTTP(provider.AddrInfo) {
 		log.Debugf("Connecting to %s using httpsync", provider.AddrInfo.ID)
 
-		sync := httpsync.NewSync(scraper.linkSystem, &http.Client{}, func(i peer.ID, c cid.Cid) {})
-		closer = func() {
-			sync.Close()
-		}
-
-		_syncer, err := sync.NewSyncer(provider.AddrInfo.ID, provider.AddrInfo.Addrs[0], rl)
+		_syncer, err := scraper.httpSync.NewSyncer(provider.AddrInfo.ID, provider.AddrInfo.Addrs[0], rl)
 		if err != nil {
 			return fail(fmt.Errorf("could not create http syncer: %w", err))
 		}
@@ -288,21 +302,6 @@ func (scraper *Scraper) NewProviderHandle(
 		if err := scraper.host.Connect(ctx, provider.AddrInfo); err != nil {
 			return fail(fmt.Errorf("failed to connect to host: %w", err))
 		}
-		scraper.host.ConnManager().Protect(provider.AddrInfo.ID, "scraper")
-
-		sync, err := dtsync.NewSyncWithDT(
-			scraper.host,
-			scraper.dataTransfer,
-			scraper.gsExchange,
-			func(i peer.ID, c cid.Cid) {},
-		)
-		if err != nil {
-			return fail(fmt.Errorf("could not create datastore: %w", err))
-		}
-		closer = func() {
-			sync.Close()
-			scraper.host.ConnManager().Unprotect(provider.AddrInfo.ID, "scraper")
-		}
 
 		protos, err := scraper.host.Peerstore().GetProtocols(provider.AddrInfo.ID)
 		if err != nil {
@@ -311,7 +310,7 @@ func (scraper *Scraper) NewProviderHandle(
 
 		topic := topicFromSupportedProtocols(protos)
 
-		syncer = sync.NewSyncer(provider.AddrInfo.ID, topic, rl)
+		syncer = scraper.dtSync.NewSyncer(provider.AddrInfo.ID, topic, rl)
 	}
 
 	log.Debugf("Created new provider handle for %s", provider.AddrInfo.ID)
@@ -320,7 +319,6 @@ func (scraper *Scraper) NewProviderHandle(
 		scraper: scraper,
 		syncer:  syncer,
 		info:    provider,
-		Close:   closer,
 		log:     log,
 	}, nil
 }
@@ -329,7 +327,6 @@ func (scraper *Scraper) NewProviderHandle(
 // when done
 type ProviderHandle struct {
 	scraper *Scraper
-	Close   func()
 	syncer  legs.Syncer
 	info    finder_model.ProviderInfo
 	log     *zap.SugaredLogger
