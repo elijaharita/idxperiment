@@ -91,6 +91,8 @@ func main() {
 		wg.Add(1)
 
 		go func() {
+			defer wg.Done()
+
 			for {
 				lk.Lock()
 				if index >= len(providers) {
@@ -100,7 +102,6 @@ func main() {
 				provider := providers[index]
 				log.Infof("Getting ad chain from provider %s (%d/%d)", provider.AddrInfo.ID, index, len(providers))
 				index++
-
 				lk.Unlock()
 
 				func() {
@@ -141,8 +142,6 @@ func main() {
 					lk.Unlock()
 				}()
 			}
-
-			wg.Done()
 		}()
 	}
 

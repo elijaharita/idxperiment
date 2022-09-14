@@ -1,4 +1,4 @@
-module github.com/application-research/autoretrieve
+module github.com/elijaharita/idxperiment
 
 go 1.18
 
