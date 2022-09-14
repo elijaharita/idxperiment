@@ -112,7 +112,7 @@ func main() {
 				func() {
 					syncCtx, syncCancel := context.WithCancel(ctx)
 					syncTimer := time.AfterFunc(time.Minute, func() {
-						log.Infof("Sync timed out for %s, attempting to cancel", provider.AddrInfo.ID)
+						log.Warnf("Sync timed out for %s, attempting to cancel", provider.AddrInfo.ID)
 						syncCancel()
 					})
 
