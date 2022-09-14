@@ -133,7 +133,6 @@ func main() {
 						return
 					}
 
-					log.Infof("Loading ads for %s", provider.AddrInfo.ID)
 					ads, err := handle.loadAds(syncCtx, lastAd)
 					if err != nil {
 						log.Error(err)
@@ -306,8 +305,6 @@ func (handle *ProviderHandle) syncer(ctx context.Context) (legs.Syncer, error) {
 	// Open either HTTP or DataTransfer syncer depending on addrInfo's supported
 	// protocols
 	if isHTTP(handle.provider.AddrInfo) {
-		log.Debugf("Connecting to %s using httpsync", handle.provider.AddrInfo.ID)
-
 		_syncer, err := handle.scraper.httpSync.NewSyncer(handle.provider.AddrInfo.ID, handle.provider.AddrInfo.Addrs[0], rl)
 		if err != nil {
 			return fail(fmt.Errorf("could not create http syncer: %w", err))
@@ -315,8 +312,6 @@ func (handle *ProviderHandle) syncer(ctx context.Context) (legs.Syncer, error) {
 
 		syncer = _syncer
 	} else {
-		log.Debugf("Connecting to %s using dtsync", handle.provider.AddrInfo.ID)
-
 		handle.scraper.host.Peerstore().AddAddrs(handle.provider.AddrInfo.ID, handle.provider.AddrInfo.Addrs, time.Hour*24*7)
 
 		if err := handle.scraper.host.Connect(ctx, handle.provider.AddrInfo); err != nil {
@@ -344,7 +339,6 @@ func (handle *ProviderHandle) syncAds(ctx context.Context) (cid.Cid, error) {
 		return cid.Undef, err
 	}
 
-	// TODO: specific prototype?
 	adsSSB := builder.NewSelectorSpecBuilder(basicnode.Prototype.Any)
 	adsSelector := adsSSB.ExploreRecursive(
 		selector.RecursionLimitNone(),
@@ -395,12 +389,10 @@ func (handle *ProviderHandle) loadAds(
 		}
 
 		// Load the current advertisement node
-		//
-		// TODO: specific prototype?
 		adNode, err := handle.scraper.linkSystem.Load(
 			ipld.LinkContext{},
 			cidlink.Link{Cid: currAdCid},
-			basicnode.Prototype.Any,
+			finder_schema.AdvertisementPrototype,
 		)
 		if err != nil {
 			return fail(fmt.Errorf("failed to load advertisement: %v", err))
