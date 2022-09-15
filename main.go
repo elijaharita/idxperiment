@@ -165,7 +165,7 @@ func main() {
 		"Successes: %d | Failures: %d | Success Rate: %f%%",
 		successCount,
 		len(providers)-successCount,
-		float32(successCount)/float32(len(providers)),
+		float32(successCount)/float32(len(providers))*100.0,
 	)
 }
 
@@ -220,6 +220,7 @@ func NewScraper(
 		h,
 		dt,
 		gsExchange,
+		&lsys,
 		func(i peer.ID, c cid.Cid) {},
 	)
 	if err != nil {
