@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"path"
 	"regexp"
 	"sync"
@@ -19,11 +21,12 @@ import (
 	"github.com/filecoin-project/go-legs"
 	"github.com/filecoin-project/go-legs/dtsync"
 	"github.com/filecoin-project/go-legs/httpsync"
+	"github.com/filecoin-project/index-provider/engine"
+	"github.com/filecoin-project/index-provider/metadata"
 	finder_model "github.com/filecoin-project/storetheindex/api/v0/finder/model"
 	finder_schema "github.com/filecoin-project/storetheindex/api/v0/ingest/schema"
 	"github.com/ipfs/go-cid"
 	"github.com/ipfs/go-datastore"
-	flatfs "github.com/ipfs/go-ds-flatfs"
 	leveldb "github.com/ipfs/go-ds-leveldb"
 	"github.com/ipfs/go-graphsync"
 	gsimpl "github.com/ipfs/go-graphsync/impl"
@@ -40,6 +43,8 @@ import (
 	host "github.com/libp2p/go-libp2p-core"
 	peer "github.com/libp2p/go-libp2p-core/peer"
 	"github.com/multiformats/go-multiaddr"
+	"github.com/multiformats/go-multicodec"
+	"github.com/willscott/index-observer/safemapds"
 	"go.uber.org/zap"
 	"golang.org/x/time/rate"
 )
@@ -49,30 +54,54 @@ var log = logging.Logger("idxperiment")
 func main() {
 	logging.SetLogLevel("idxperiment", "debug")
 
+	ctx := context.Background()
+
 	if err := os.MkdirAll("data", 0755); err != nil {
 		log.Fatal(err)
 	}
 
+	// ds, err := leveldb.NewDatastore("", nil)
 	ds, err := leveldb.NewDatastore("data/datastore", nil)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	bsDS, err := flatfs.CreateOrOpen("data/blockstore", flatfs.NextToLast(3), true)
-	if err != nil {
-		log.Fatal(err)
-	}
+	// bsDS, err := flatfs.CreateOrOpen("data/blockstore", flatfs.NextToLast(3), true)
+	// if err != nil {
+	// 	log.Fatal(err)
+	// }
+	bsDS := safemapds.NewMapDatastore()
 	bs := blockstore.NewBlockstoreNoPrefix(bsDS)
 
-	h, err := libp2p.New(libp2p.DisableRelay(), libp2p.ResourceManager(nil), libp2p.WithDialTimeout(time.Second*5))
+	h, err := libp2p.New(libp2p.DisableRelay(), libp2p.ResourceManager(nil), libp2p.WithDialTimeout(time.Second*15))
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	ctx := context.Background()
+	log.Infof("Peer ID: %s", h.ID())
 
-	scraper, err := NewScraper(ctx, "https://cid.contact", bs, ds, h)
+	reader := bufio.NewReader(os.Stdin)
+	log.Infof("Press Enter to continue...")
+	reader.ReadLine()
+
+	scraper, err := NewScraper(ctx, "http://localhost:3000", bs, ds, h)
+	// scraper, err := NewScraper(ctx, "https://cid.contact", bs, ds, h)
 	if err != nil {
+		log.Fatal(err)
+	}
+
+	eng, err := engine.New(
+		// engine.WithHost(h),
+		// engine.WithDataTransfer(scraper.dataTransfer),
+		engine.WithDatastore(ds),
+		engine.WithPublisherKind(engine.DataTransferPublisher),
+		engine.WithPurgeCacheOnStart(true),
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if err := eng.Start(ctx); err != nil {
 		log.Fatal(err)
 	}
 
@@ -87,6 +116,9 @@ func main() {
 	var lk sync.Mutex
 	var wg sync.WaitGroup
 	threadCount := 0
+
+	// Wait for datastore migration
+	time.Sleep(time.Millisecond * 100)
 
 	for i := 0; i < 20; i++ {
 		wg.Add(1)
@@ -105,13 +137,13 @@ func main() {
 					break
 				}
 				provider := providers[index]
-				log.Infof("Getting ad chain from provider %s (%d/%d)", provider.AddrInfo.ID, index, len(providers))
+				log.Infof("Getting ad chain from provider %s (%d/%d)", provider.AddrInfo, index, len(providers))
 				index++
 				lk.Unlock()
 
 				func() {
 					syncCtx, syncCancel := context.WithCancel(ctx)
-					syncTimer := time.AfterFunc(time.Minute, func() {
+					syncTimer := time.AfterFunc(time.Second*30, func() {
 						log.Warnf("Sync timed out for %s, attempting to cancel", provider.AddrInfo.ID)
 						syncCancel()
 					})
@@ -124,7 +156,8 @@ func main() {
 						return
 					}
 
-					log.Infof("Syncing ads for %s", provider.AddrInfo.ID)
+					log := handle.log
+
 					lastAd, err := handle.syncAds(syncCtx)
 					if err != nil {
 						log.Error(err)
@@ -132,6 +165,8 @@ func main() {
 						syncCancel()
 						return
 					}
+
+					log.Infof("Last ad: %s", lastAd)
 
 					ads, err := handle.loadAds(syncCtx, lastAd)
 					if err != nil {
@@ -146,8 +181,35 @@ func main() {
 
 					lk.Lock()
 					successCount++
-					log.Infof("Got %d ads from %s", len(ads), provider.AddrInfo.ID)
+					log.Infof("Got %d ads", len(ads))
 					lk.Unlock()
+
+					for _, ad := range ads {
+						var md metadata.Metadata
+						if err := md.UnmarshalBinary(ad.Metadata); err != nil {
+							log.Error("failed to unmarshal ad metadata: %v", err)
+							return
+						}
+
+						if md.Get(multicodec.TransportGraphsyncFilecoinv1) == nil {
+							log.Warn("Provider wasn't advertising for graphsync")
+							return
+						}
+
+						mdUpdated := metadata.New(metadata.Bitswap{})
+						mdUpdatedBytes, err := mdUpdated.MarshalBinary()
+						if err != nil {
+							log.Error("Could not marshal updated metadata")
+						}
+						ad.Metadata = mdUpdatedBytes
+
+						cid, err := eng.Publish(ctx, ad)
+						if err != nil {
+							log.Error("Failed to publish ad chain")
+						}
+
+						log.Infof("Published ad chain with CID %s", cid)
+					}
 				}()
 			}
 
@@ -167,6 +229,19 @@ func main() {
 		len(providers)-successCount,
 		float32(successCount)/float32(len(providers))*100.0,
 	)
+
+	doneChan := make(chan os.Signal, 1)
+	signal.Notify(doneChan, os.Interrupt)
+	<-doneChan
+	signal.Stop(doneChan)
+
+	log.Info("Shutting down...")
+
+	if err := eng.Shutdown(); err != nil {
+		log.Fatal(err)
+	}
+
+	log.Info("Stopped")
 }
 
 type Scraper struct {
@@ -274,8 +349,6 @@ func (scraper *Scraper) NewProviderHandle(
 	namespace := provider.AddrInfo.ID.String()
 	log := log.Named("handle").Named(namespace[len(namespace)-5:])
 
-	log.Debugf("Created new provider handle for %s", provider.AddrInfo.ID)
-
 	return &ProviderHandle{
 		scraper:  scraper,
 		provider: provider,
@@ -345,6 +418,12 @@ func (handle *ProviderHandle) syncAds(ctx context.Context) (cid.Cid, error) {
 		selector.RecursionLimitNone(),
 		adsSSB.ExploreFields(func(efsb builder.ExploreFieldsSpecBuilder) {
 			efsb.Insert("PreviousID", adsSSB.ExploreRecursiveEdge())
+			efsb.Insert("Provider", adsSSB.Matcher())
+			efsb.Insert("Addresses", adsSSB.Matcher())
+			efsb.Insert("Signature", adsSSB.Matcher())
+			efsb.Insert("ContextID", adsSSB.Matcher())
+			efsb.Insert("Metadata", adsSSB.Matcher())
+			efsb.Insert("IsRm", adsSSB.Matcher())
 		}),
 	).Node()
 
@@ -358,7 +437,7 @@ func (handle *ProviderHandle) syncAds(ctx context.Context) (cid.Cid, error) {
 		return fail(fmt.Errorf("syncer could not get advertisements head: %v", err))
 	}
 
-	syncer, err = handle.syncer(ctx)
+	// syncer, err = handle.syncer(ctx)
 	if err != nil {
 		return cid.Undef, err
 	}
@@ -443,13 +522,13 @@ func isHTTP(p peer.AddrInfo) bool {
 }
 
 func topicFromSupportedProtocols(protos []string) string {
-	defaultTopic := "/indexer/ingest/mainnet"
-	re := regexp.MustCompile("^/legs/head/([^/0]+)")
+	topic := "/indexer/ingest/mainnet"
+	re := regexp.MustCompile(`^/legs/head/([\w/]+)/[\d\.]+`)
 	for _, proto := range protos {
 		if re.MatchString(proto) {
-			defaultTopic = re.FindStringSubmatch(proto)[1]
+			topic = re.FindStringSubmatch(proto)[1]
 			break
 		}
 	}
-	return defaultTopic
+	return topic
 }
