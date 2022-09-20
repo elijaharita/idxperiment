@@ -41,6 +41,7 @@ import (
 	"github.com/ipld/go-ipld-prime/traversal/selector/builder"
 	"github.com/libp2p/go-libp2p"
 	host "github.com/libp2p/go-libp2p-core"
+	crypto "github.com/libp2p/go-libp2p-core/crypto"
 	peer "github.com/libp2p/go-libp2p-core/peer"
 	"github.com/multiformats/go-multiaddr"
 	"github.com/multiformats/go-multicodec"
@@ -73,16 +74,38 @@ func main() {
 	bsDS := safemapds.NewMapDatastore()
 	bs := blockstore.NewBlockstoreNoPrefix(bsDS)
 
-	h, err := libp2p.New(libp2p.DisableRelay(), libp2p.ResourceManager(nil), libp2p.WithDialTimeout(time.Second*15))
+	// Load or save+generate priv key
+	var priv crypto.PrivKey
+	privBytes, err := os.ReadFile("data/peerkey")
+	if err != nil {
+		_priv, _, err := crypto.GenerateKeyPair(crypto.RSA, 2048)
+		if err != nil {
+			log.Fatal(err)
+		}
+		priv = _priv
+		privBytes, err := crypto.MarshalPrivateKey(priv)
+		if err != nil {
+			log.Fatal(err)
+		}
+		os.WriteFile("data/peerkey", privBytes, 0644)
+	} else {
+		priv, err = crypto.UnmarshalPrivateKey(privBytes)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+
+	h, err := libp2p.New(
+		libp2p.Identity(priv),
+		libp2p.DisableRelay(),
+		libp2p.ResourceManager(nil),
+		libp2p.WithDialTimeout(time.Second*15),
+	)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	log.Infof("Peer ID: %s", h.ID())
-
-	reader := bufio.NewReader(os.Stdin)
-	log.Infof("Press Enter to continue...")
-	reader.ReadLine()
 
 	scraper, err := NewScraper(ctx, "http://localhost:3000", bs, ds, h)
 	// scraper, err := NewScraper(ctx, "https://cid.contact", bs, ds, h)
@@ -90,8 +113,18 @@ func main() {
 		log.Fatal(err)
 	}
 
+	// Engine gets its own host (but with the same identity) - because it's
+	// easiest to let engine create its own datatransfer, but only one is
+	// allowed per host
+	hEng, err := libp2p.New(
+		libp2p.Identity(priv),
+		libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/3203"),
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
 	eng, err := engine.New(
-		// engine.WithHost(h),
+		engine.WithHost(hEng),
 		// engine.WithDataTransfer(scraper.dataTransfer),
 		engine.WithDatastore(ds),
 		engine.WithPublisherKind(engine.DataTransferPublisher),
@@ -100,6 +133,10 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	reader := bufio.NewReader(os.Stdin)
+	log.Infof("Press Enter to continue...")
+	reader.ReadLine()
 
 	if err := eng.Start(ctx); err != nil {
 		log.Fatal(err)
