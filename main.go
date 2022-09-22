@@ -193,7 +193,7 @@ func main() {
 						return
 					}
 
-					log := handle.log
+					log := log.With("peerID", provider.AddrInfo.ID)
 
 					lastAd, err := handle.syncAds(syncCtx)
 					if err != nil {
@@ -221,7 +221,8 @@ func main() {
 					log.Infof("Got %d ads", len(ads))
 					lk.Unlock()
 
-					for _, ad := range ads {
+					var adLinks []ipld.Link
+					for i, ad := range ads {
 						var md metadata.Metadata
 						if err := md.UnmarshalBinary(ad.Metadata); err != nil {
 							log.Error("failed to unmarshal ad metadata: %v", err)
@@ -237,15 +238,32 @@ func main() {
 						mdUpdatedBytes, err := mdUpdated.MarshalBinary()
 						if err != nil {
 							log.Error("Could not marshal updated metadata")
+							return
 						}
 						ad.Metadata = mdUpdatedBytes
 
-						cid, err := eng.Publish(ctx, ad)
-						if err != nil {
-							log.Error("Failed to publish ad chain")
+						if i != 0 {
+							ad.PreviousID = &adLinks[i-1]
 						}
 
+						if err := ad.Sign(priv); err != nil {
+							log.Error("Failed to sign ad: %v", err)
+							return
+						}
+
+						cid, err := eng.Publish(ctx, ad)
+						if err != nil {
+							log.Error("Failed to publish ad chain: %v", err)
+							return
+						}
+
+						adLinks = append(adLinks, cidlink.Link{Cid: cid})
+
 						log.Infof("Published ad chain with CID %s", cid)
+					}
+
+					if _, err := eng.PublishLatestHTTP(ctx, "127.0.0.1:3001"); err != nil {
+						log.Error("Failed to publish HTTP: %v", err)
 					}
 				}()
 			}
